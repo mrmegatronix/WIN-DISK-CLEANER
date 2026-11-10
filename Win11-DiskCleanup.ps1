@@ -1111,8 +1111,8 @@ function Measure-AllCategories {
             'OldDrivers' {
                 $drv = Get-OldDriverPackages
                 $cat.DriverPackages = $drv.Packages
-                $cat.FileCount      = $drv.Packages.Count
-                $cat.EstimatedBytes = $drv.TotalBytes
+                $cat.FileCount      = if ($drv.Packages.Count -gt 0) { $drv.Packages.Count } else { [math]::Max(1, $drv.AllCount) }
+                $cat.EstimatedBytes = if ($drv.TotalBytes -gt 0) { $drv.TotalBytes } else { -1 }
             }
             'DISM_Component' {
                 # Fast estimate via WinSxS Temp/Backup folders without blocking for 5 min on AnalyzeComponentStore unless needed
@@ -1254,17 +1254,24 @@ function Select-StorageLocation {
         Write-Host "`n---------------- SELECT $($Purpose.ToUpper()) DESTINATION ----------------" -ForegroundColor Cyan
         Write-Host ("Estimated space needed: ~{0}" -f (Format-Bytes $RequiredBytes)) -ForegroundColor Gray
 
-        $vols = @(Get-Volume -ErrorAction SilentlyContinue | Where-Object {
-            $_.DriveLetter -and $_.DriveType -in @('Fixed','Removable','Network') -and $_.HealthStatus -eq 'Healthy'
-        } | Sort-Object @{Expression={ $_.DriveLetter -eq $script:SysDriveLetter }; Ascending=$true}, DriveLetter)
+        $logicalDisks = @(Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction SilentlyContinue | Where-Object {
+            $_.DeviceID -and $_.DriveType -in @(2, 3, 4)
+        } | Sort-Object @{Expression={ $_.DeviceID -ieq $script:SysDrive }; Ascending=$true}, DeviceID)
 
         $selectable = New-Object 'System.Collections.Generic.List[pscustomobject]'
         $idx = 0
-        foreach ($v in $vols) {
-            $isSys = ($v.DriveLetter -ieq $script:SysDriveLetter)
+        foreach ($ld in $logicalDisks) {
+            $isSys = ($ld.DeviceID -ieq $script:SysDrive)
             if ($isSys -and -not $AllowSystemDrive) { continue }
             $idx++
-            $status = if ($v.SizeRemaining -lt $needWithMargin) {
+            $freeBytes = [int64]$ld.FreeSpace
+            $typeLabel = switch ($ld.DriveType) {
+                2 { 'Removable' }
+                3 { 'Fixed' }
+                4 { 'Network' }
+                default { 'Drive' }
+            }
+            $status = if ($freeBytes -lt $needWithMargin) {
                 'LOW SPACE'
             } elseif ($isSys) {
                 'WARN: System drive (uses space being cleaned)'
@@ -1273,27 +1280,30 @@ function Select-StorageLocation {
             }
             $selectable.Add([pscustomobject]@{
                 Index  = $idx
-                Letter = "$($v.DriveLetter):"
-                Label  = "$($v.FileSystemLabel)"
-                Type   = "$($v.DriveType)"
-                Free   = [int64]$v.SizeRemaining
+                Letter = "$($ld.DeviceID)"
+                Label  = "$($ld.VolumeName)"
+                Type   = $typeLabel
+                Free   = $freeBytes
                 Status = $status
             })
-            Write-Host ('  {0}  {1,-4} {2,-14} {3,-10} Free: {4,-10} [{5}]' -f $idx, "$($v.DriveLetter):", "$($v.FileSystemLabel)", "$($v.DriveType)", (Format-Bytes $v.SizeRemaining), $status)
+            Write-Host ('  {0}  {1,-4} {2,-14} {3,-10} Free: {4,-10} [{5}]' -f $idx, "$($ld.DeviceID)", "$($ld.VolumeName)", $typeLabel, (Format-Bytes $freeBytes), $status)
         }
-        Write-Host '  B  Browse for a folder...'
-        Write-Host '  T  Type a custom path (local or \\server\share)'
+        if ($selectable.Count -eq 0) {
+            Write-Host "  [!] No secondary drive letter detected (System drive $($script:SysDrive) is excluded so it does not lose free space)." -ForegroundColor Yellow
+            Write-Host "      Plug in a USB drive and press R to refresh, or choose B/T for a network share (\\server\share), or S to skip." -ForegroundColor Yellow
+        }
+        Write-Host '  R  Refresh drive list (after plugging in USB / external drive)'
+        Write-Host '  B  Browse for a folder (another drive or network share)...'
+        Write-Host '  T  Type a custom path on another drive or \\server\share'
         Write-Host "  S  Skip $Purpose"
         Write-Host '  Q  Quit cleanup'
 
         $nonSysSelectable = @($selectable | Where-Object { $_.Letter -ine $script:SysDrive })
-        if ($nonSysSelectable.Count -eq 0 -and $AllowSystemDrive) {
-            Write-Host "  [!] WARNING: No secondary drive detected! Saving $Purpose to $($script:SysDrive) will CONSUME free space on $($script:SysDrive)!" -ForegroundColor Red
-        }
-        $defaultHint = if ($PresetPath) { $PresetPath } elseif ($nonSysSelectable.Count -gt 0) { "$($nonSysSelectable[0].Index)" } else { 'S' }
+        $defaultHint = if ($PresetPath) { $PresetPath } elseif ($nonSysSelectable.Count -gt 0) { "$($nonSysSelectable[0].Index)" } else { 'B' }
         $choice = Read-Host "Choice [$defaultHint]"
         if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $defaultHint }
 
+        if ($choice -match '^[Rr]$') { continue }
         if ($choice -match '^[Qq]$') { return @{ Action = 'Quit'; Path = '' } }
         if ($choice -match '^[Ss]$') { return @{ Action = 'Skip'; Path = '' } }
 
@@ -1827,6 +1837,7 @@ function Invoke-ConfirmedCategories {
                         Write-Log -Message "Skipped in-use driver $($pkg.PublishedName): $out" -Level 'SKIP'
                     }
                 }
+                $cleanMgrHandlers.Add('Device Driver Packages')
                 Write-Host (" [OK] {0,-48} {1,10} reclaimed ({2} in-use kept)" -f $cat.Name, (Format-Bytes $drvFreed), $drvLocked) -ForegroundColor Green
                 $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Cleaned'; Reclaimed = $drvFreed; Locked = $drvLocked })
             }
@@ -2299,28 +2310,37 @@ try {
         }
     }
 
-    # Ask where to save Driver Backup if OldDrivers is selected
+    # Ask where to save Driver Backup (always on ANOTHER drive, never C:!)
     $driverBackupDir = ''
     $drvCat = $selectedCats | Where-Object { $_.Id -eq 'OldDrivers' } | Select-Object -First 1
-    if ($drvCat) {
+    $wantDriverBackup = ($null -ne $drvCat)
+    if (-not $wantDriverBackup) {
+        $askBk = Read-Host "`nBack up all third-party drivers to another drive before cleaning? [Y/n]"
+        if ($askBk -notmatch '^[Nn]$') { $wantDriverBackup = $true }
+    }
+    if ($wantDriverBackup) {
         $repoSize = [int64]1GB
-        $loc = Select-StorageLocation -Purpose 'DriverBackup' -RequiredBytes $repoSize -AllowSystemDrive $true -PresetPath $DriverBackupPath
+        $loc = Select-StorageLocation -Purpose 'DriverBackup' -RequiredBytes $repoSize -AllowSystemDrive $false -PresetPath $DriverBackupPath
         if ($loc.Action -eq 'Quit') { exit 0 }
         if ($loc.Action -eq 'Skip') {
-            $drvCat.Confirmed = $false
-            $selectedCats = @($categories | Where-Object { $_.Confirmed })
-            Write-Host '  [INFO] Driver backup skipped; Superseded Device Driver Packages cleanup has been DISABLED.' -ForegroundColor Yellow
+            if ($drvCat) {
+                $drvCat.Confirmed = $false
+                $selectedCats = @($categories | Where-Object { $_.Confirmed })
+                Write-Host '  [INFO] Driver backup skipped; Superseded Device Driver Packages cleanup has been DISABLED.' -ForegroundColor Yellow
+            } else {
+                Write-Host '  [INFO] Optional driver backup skipped.' -ForegroundColor Yellow
+            }
         } else {
             $driverBackupDir = $loc.Path
         }
     }
 
-    # Ask where to save Windows Event Log Backup if EventLogs is selected
+    # Ask where to save Windows Event Log Backup if EventLogs is selected (always on ANOTHER drive, never C:!)
     $eventLogBackupDir = ''
     $evtCat = $selectedCats | Where-Object { $_.Id -eq 'EventLogs' } | Select-Object -First 1
     if ($evtCat) {
         $evtSize = [math]::Max([int64]50MB, $evtCat.EstimatedBytes)
-        $eLoc = Select-StorageLocation -Purpose 'EventLogBackup' -RequiredBytes $evtSize -AllowSystemDrive $true -PresetPath $EventLogBackupPath
+        $eLoc = Select-StorageLocation -Purpose 'EventLogBackup' -RequiredBytes $evtSize -AllowSystemDrive $false -PresetPath $EventLogBackupPath
         if ($eLoc.Action -eq 'Quit') { exit 0 }
         if ($eLoc.Action -eq 'Skip') {
             $evtCat.Confirmed = $false
@@ -2361,10 +2381,10 @@ try {
     Set-PreventSleep -Enable $true
     Invoke-OptionalRestorePoint -SystemRestoreEnabled $preScan.SystemRestoreOn
 
-    # Execute mandatory driver backup if OldDrivers is still confirmed
-    if ($drvCat -and $drvCat.Confirmed) {
+    # Execute driver backup if a backup destination was chosen
+    if ($driverBackupDir) {
         $bkOk = Backup-Drivers -DestinationPath $driverBackupDir
-        if (-not $bkOk) {
+        if (-not $bkOk -and $drvCat) {
             $drvCat.Confirmed = $false
             Write-Host '[WARN] Driver cleanup was deselected because driver backup verification did not pass.' -ForegroundColor Yellow
         }
