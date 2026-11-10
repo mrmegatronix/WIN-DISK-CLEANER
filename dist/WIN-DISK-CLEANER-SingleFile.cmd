@@ -240,12 +240,13 @@ function Write-Log {
 
 function Format-Bytes {
     param([int64]$Bytes)
-    if ($Bytes -lt 0) { $Bytes = 0 }
-    if ($Bytes -ge 1TB) { return ('{0:N2} TB' -f ($Bytes / 1TB)) }
-    if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }
-    if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
-    if ($Bytes -ge 1KB) { return ('{0:N1} KB' -f ($Bytes / 1KB)) }
-    return "$Bytes B"
+    $sign = if ($Bytes -lt 0) { '-' } else { '' }
+    $abs  = [math]::Abs($Bytes)
+    if ($abs -ge 1TB) { return ('{0}{1:N2} TB' -f $sign, ($abs / 1TB)) }
+    if ($abs -ge 1GB) { return ('{0}{1:N2} GB' -f $sign, ($abs / 1GB)) }
+    if ($abs -ge 1MB) { return ('{0}{1:N1} MB' -f $sign, ($abs / 1MB)) }
+    if ($abs -ge 1KB) { return ('{0}{1:N1} KB' -f $sign, ($abs / 1KB)) }
+    return "$sign$abs B"
 }
 
 function Format-MiddleEllipsis {
@@ -828,6 +829,23 @@ function Get-CleanupCategories {
         -Roots ($tempRoots | Select-Object -Unique) -UseAgeFilter $true -CanQuarantine $true `
         -PresetModes @('Quick','Standard','Deep')
 
+    # 1b. Previous Backups Stored on System Drive (C:\DriverBackup, C:\EventLogBackup)
+    $sysBackupRoots = @(
+        (Join-Path "$($script:SysDrive)\" 'DriverBackup'),
+        (Join-Path "$($script:SysDrive)\" 'EventLogBackup')
+    )
+    Add-Cat -Id 'SysDriveBackups' -Name "Driver/EventLog Backups Stored on $($script:SysDrive)" -Risk 'Safe' -Method 'Files' `
+        -Roots $sysBackupRoots -CanQuarantine $false `
+        -WarningText "Removes DriverBackup / EventLogBackup folders that were saved onto $($script:SysDrive) and are consuming system drive space." `
+        -PresetModes @('Quick','Standard','Deep')
+
+    # 1c. Hibernation File (hiberfil.sys via powercfg /h off)
+    $hiberFile = Join-Path "$($script:SysDrive)\" 'hiberfil.sys'
+    Add-Cat -Id 'HibernationFile' -Name 'Hibernation File (hiberfil.sys -> powercfg /h off)' -Risk 'Moderate' -Method 'HibernationOff' `
+        -Roots @("$($script:SysDrive)\") -FileFilter 'hiberfil.sys' `
+        -WarningText 'Disables Hibernation (powercfg /h off) to immediately reclaim the entire hiberfil.sys size (typically 6-16 GB).' `
+        -PresetModes @('Standard','Deep')
+
     # 2. Windows Error Reporting (WER)
     $werRoots = @(
         "$env:ProgramData\Microsoft\Windows\WER\ReportArchive",
@@ -1078,6 +1096,16 @@ function Measure-AllCategories {
         if ($cat.DisabledReason -ne '') { continue }
 
         switch ($cat.Method) {
+            'HibernationOff' {
+                $hiberPath = Join-Path "$($script:SysDrive)\" 'hiberfil.sys'
+                if (Test-Path -LiteralPath $hiberPath) {
+                    $hItem = Get-Item -LiteralPath $hiberPath -Force -ErrorAction SilentlyContinue
+                    if ($hItem) {
+                        $cat.FileCount      = 1
+                        $cat.EstimatedBytes = [int64]$hItem.Length
+                    }
+                }
+            }
             { $_ -in @('Files','WUFiles','DeliveryOpt','WindowsOld','EventLogs','SearchIndex','WslVhdx') } {
                 if ($cat.Roots.Count -eq 0) { continue }
                 $age = if ($cat.UseAgeFilter) { $MinAgeHours } else { 0 }
@@ -1279,7 +1307,11 @@ function Select-StorageLocation {
         Write-Host "  S  Skip $Purpose"
         Write-Host '  Q  Quit cleanup'
 
-        $defaultHint = if ($PresetPath) { $PresetPath } elseif ($selectable.Count -gt 0) { '1' } else { 'T' }
+        $nonSysSelectable = @($selectable | Where-Object { $_.Letter -ine $script:SysDrive })
+        if ($nonSysSelectable.Count -eq 0 -and $AllowSystemDrive) {
+            Write-Host "  [!] WARNING: No secondary drive detected! Saving $Purpose to $($script:SysDrive) will CONSUME free space on $($script:SysDrive)!" -ForegroundColor Red
+        }
+        $defaultHint = if ($PresetPath) { $PresetPath } elseif ($nonSysSelectable.Count -gt 0) { "$($nonSysSelectable[0].Index)" } else { 'S' }
         $choice = Read-Host "Choice [$defaultHint]"
         if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $defaultHint }
 
@@ -1747,6 +1779,19 @@ function Invoke-ConfirmedCategories {
         }
 
         switch ($cat.Method) {
+            'HibernationOff' {
+                $hiberPath = Join-Path "$($script:SysDrive)\" 'hiberfil.sys'
+                $hLen = if (Test-Path -LiteralPath $hiberPath) { (Get-Item -LiteralPath $hiberPath -Force).Length } else { [int64]0 }
+                [void](& powercfg.exe /h off 2>&1)
+                if (-not (Test-Path -LiteralPath $hiberPath)) {
+                    $script:Stats.FreedBytes += $hLen
+                    Write-Host (" [OK] {0,-48} {1,10} reclaimed" -f $cat.Name, (Format-Bytes $hLen)) -ForegroundColor Green
+                    Write-Log -Message "Disabled hibernation (powercfg /h off); reclaimed $hLen bytes" -Level 'DELETE'
+                    $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Disabled Hibernation'; Reclaimed = $hLen; Locked = 0 })
+                } else {
+                    Write-Host (" [WARN] Could not remove hiberfil.sys" -f $cat.Name) -ForegroundColor Yellow
+                }
+            }
             'Files' {
                 $r = Invoke-FileListCleanup -Category $cat -UseQuarantine $UseQuarantine -QuarantineSetDir $QuarantineSetDir
                 Write-Host (" [OK] {0,-48} {1,10} reclaimed ({2} locked)" -f $cat.Name, (Format-Bytes $r.FreedBytes), $r.LockedCount) -ForegroundColor Green
