@@ -16,24 +16,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build SingleFile CMD & Portable ZIP
-        shell: pwsh
-        run: ./Build-Release.ps1
-
-      - name: Compile Native Windows 11 EXE (ps2exe)
-        shell: pwsh
+      - name: Build & Verify SingleFile CMD and Portable ZIP (Windows PowerShell 5.1)
+        shell: powershell
         run: |
+          .\Build-Release.ps1
+          # Test that Windows cmd.exe 'more +21' extracts a valid PowerShell 5.1 script
+          cmd.exe /c 'more +21 dist\WIN-DISK-CLEANER-SingleFile.cmd > "%TEMP%\test_extract.ps1"'
+          $errors = $null; $tokens = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$env:TEMP\test_extract.ps1", [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { throw "Windows 5.1 AST parse failed on extracted payload: $($errors[0])" }
+          Write-Host "Windows PowerShell 5.1 + cmd.exe extraction verified."
+
+      - name: Compile Native Windows 11 EXE using Windows PowerShell 5.1 (.NET Framework 4.x)
+        shell: powershell
+        run: |
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
           Install-Module -Name ps2exe -Force -Scope CurrentUser
           Invoke-ps2exe -inputFile "$PWD\Win11-DiskCleanup.ps1" `
                         -outputFile "$PWD\dist\WIN-DISK-CLEANER.exe" `
                         -title "WIN-DISK-CLEANER" `
                         -description "Windows 11 Safe System Disk Cleanup, Driver & EventLog Backup, Quarantine & Repair" `
-                        -version "6.0.0.0" `
+                        -version "6.1.0.0" `
                         -requireAdmin `
                         -x64 `
                         -conHost
+          if (-not (Test-Path "$PWD\dist\WIN-DISK-CLEANER.exe")) { throw "WIN-DISK-CLEANER.exe was not created!" }
           $h = Get-FileHash -LiteralPath "$PWD\dist\WIN-DISK-CLEANER.exe" -Algorithm SHA256
-          Add-Content -LiteralPath "$PWD\dist\SHA256SUMS.txt" -Value ("{0}  WIN-DISK-CLEANER.exe" -f $h.Hash.ToLowerInvariant())
+          Add-Content -LiteralPath "$PWD\dist\SHA256SUMS.txt" -Value ("{0}  WIN-DISK-CLEANER.exe" -f $h.Hash.ToLowerInvariant()) -Encoding ASCII
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
@@ -41,9 +51,9 @@ jobs:
           name: WIN-DISK-CLEANER-v6.0.0-Build
           path: dist/*
 
-      - name: Attach EXE to Latest Release if Present
-        shell: pwsh
+      - name: Attach Verified Assets to GitHub Release v6.0.0
+        shell: powershell
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload v6.0.0 dist/WIN-DISK-CLEANER.exe dist/WIN-DISK-CLEANER-SingleFile.cmd dist/WIN-DISK-CLEANER-v6.0.0-Portable.zip dist/SHA256SUMS.txt --clobber 2>$null || Write-Host "Release v6.0.0 not created yet or upload skipped"
+          gh release upload v6.0.0 dist/WIN-DISK-CLEANER.exe dist/WIN-DISK-CLEANER-SingleFile.cmd dist/WIN-DISK-CLEANER-v6.0.0-Portable.zip dist/SHA256SUMS.txt Win11-DiskCleanup.ps1 Run-Cleanup.cmd --clobber

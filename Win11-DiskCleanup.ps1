@@ -1,14 +1,14 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Windows 11 Safe System Disk Cleanup, Driver Backup, Quarantine, Repair & Reporting Utility (Plan v6)
+    Windows 11 Safe System Disk Cleanup, Driver Backup, Quarantine, Repair & Reporting Utility (Plan v6.1)
 .DESCRIPTION
     Scan-first, confirm-all Windows 11 cleanup utility with:
     - Self-elevation and automatic relaunch in Windows PowerShell 5.1 if started from PowerShell 7
     - Pre-Scan read-only system health checks (OS build, pending reboot, WU busy, disk health, dirty bit, battery, VSS)
     - Safe stack-based file walker that never traverses junctions or symlinks (ReparsePoints)
     - Quick / Standard / Deep / Manual confirmation presets (every category still confirmed; Irreversible requires 'YES')
-    - Mandatory verified Driver Backup before removing superseded driver packages
+    - Mandatory verified Driver Backup & Windows Event Log Backup
     - 7-day Quarantine mode on a secondary drive with manifest.csv and one-click restore script
     - Wildcard exclusion list (inline + exclusions.txt)
     - Nested progress bars, console title status bar, in-place status line, and Windows Terminal taskbar progress
@@ -49,7 +49,6 @@ param(
     [switch]$NoProgress
 )
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ============================================================================
@@ -83,6 +82,18 @@ function Invoke-SelfElevationAndHostCheck {
 
     if (-not $needs51 -and -not $needsAdmin) { return }
 
+    # If running inside a compiled EXE (ps2exe) where $ScriptPath is empty, check admin only
+    if ([string]::IsNullOrWhiteSpace($ScriptPath) -or -not (Test-Path -LiteralPath $ScriptPath)) {
+        if ($needsAdmin) {
+            Write-Host '[ERROR] Please right-click and select "Run as administrator".' -ForegroundColor Red
+            Read-Host 'Press Enter to exit'
+            exit 1
+        }
+        return
+    }
+
+    try { Unblock-File -LiteralPath $ScriptPath -ErrorAction SilentlyContinue } catch { }
+
     $winPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $winPs)) { $winPs = 'powershell.exe' }
 
@@ -107,12 +118,13 @@ function Invoke-SelfElevationAndHostCheck {
         Write-Host '[INFO] Relaunching in Windows PowerShell 5.1 for native cmdlet compatibility...' -ForegroundColor Yellow
     }
     if ($needsAdmin) {
-        Write-Host '[INFO] Administrator privileges required. Requesting elevation...' -ForegroundColor Yellow
+        Write-Host '[INFO] Administrator privileges required. Requesting UAC elevation...' -ForegroundColor Yellow
     }
 
     $startParams = @{
         FilePath     = $winPs
         ArgumentList = ($argList -join ' ')
+        Wait         = $true
     }
     if ($needsAdmin) { $startParams['Verb'] = 'RunAs' }
 
@@ -120,12 +132,15 @@ function Invoke-SelfElevationAndHostCheck {
         Start-Process @startParams | Out-Null
     } catch {
         Write-Host "[ERROR] Failed to relaunch elevated session: $($_.Exception.Message)" -ForegroundColor Red
+        Read-Host 'Press Enter to exit'
         exit 1
     }
     exit 0
 }
 
-Invoke-SelfElevationAndHostCheck -BoundParams $PSBoundParameters -ScriptPath $MyInvocation.MyCommand.Path
+$resolvedSelfPath = $MyInvocation.MyCommand.Path
+if ([string]::IsNullOrWhiteSpace($resolvedSelfPath)) { $resolvedSelfPath = $PSCommandPath }
+Invoke-SelfElevationAndHostCheck -BoundParams $PSBoundParameters -ScriptPath $resolvedSelfPath
 
 # ============================================================================
 # SLEEP PREVENTION (P/INVOKE)
@@ -257,7 +272,7 @@ function Write-StatusLine {
         $script:Stats.StageIndex, $script:Stats.StageTotal, $script:Stats.StageName, `
         $reclaimed, $est, $script:Stats.LockedCount, $script:Stats.ErrorCount, $elapsed
     if ($line.Length -gt $width) {
-        $line = $line.Substring(0, $width - 1) + [char]0x2026
+        $line = $line.Substring(0, [math]::Max(1, $width - 3)) + '...'
     } else {
         $line = $line.PadRight($width)
     }
@@ -309,12 +324,18 @@ function Initialize-Exclusions {
     foreach ($e in $Exclusions) {
         if (-not [string]::IsNullOrWhiteSpace($e)) { $list.Add($e.Trim()) }
     }
-    $extFile = Join-Path $PSScriptRoot 'exclusions.txt'
-    if (Test-Path -LiteralPath $extFile) {
-        foreach ($line in (Get-Content -LiteralPath $extFile -ErrorAction SilentlyContinue)) {
-            $trimmed = $line.Trim()
-            if ($trimmed -ne '' -and -not $trimmed.StartsWith('#')) {
-                $list.Add([Environment]::ExpandEnvironmentVariables($trimmed))
+    $baseDir = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($baseDir)) {
+        try { $baseDir = [System.AppDomain]::CurrentDomain.BaseDirectory } catch { $baseDir = '' }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($baseDir)) {
+        $extFile = Join-Path $baseDir 'exclusions.txt'
+        if (Test-Path -LiteralPath $extFile) {
+            foreach ($line in (Get-Content -LiteralPath $extFile -ErrorAction SilentlyContinue)) {
+                $trimmed = $line.Trim()
+                if ($trimmed -ne '' -and -not $trimmed.StartsWith('#')) {
+                    $list.Add([Environment]::ExpandEnvironmentVariables($trimmed))
+                }
             }
         }
     }
@@ -1607,7 +1628,7 @@ function Invoke-DismCleanup {
         '/Online /Cleanup-Image /StartComponentCleanup'
     }
     $label = if ($ResetBase) { 'DISM /ResetBase' } else { 'DISM /StartComponentCleanup' }
-    Write-Host "  ▶ Running $label..." -ForegroundColor Cyan
+    Write-Host "  >> Running $label..." -ForegroundColor Cyan
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName               = 'dism.exe'
@@ -1648,7 +1669,7 @@ function Invoke-CleanMgrHandlers {
             }
         }
 
-        Write-Host "  ▶ Running cleanmgr /sagerun:$SagesetNumber ($($Handlers -join ', '))..." -ForegroundColor Cyan
+        Write-Host "  >> Running cleanmgr /sagerun:$SagesetNumber ($($Handlers -join ', '))..." -ForegroundColor Cyan
         $proc = Start-Process -FilePath 'cleanmgr.exe' -ArgumentList "/sagerun:$SagesetNumber" -PassThru -NoNewWindow
         $timeoutMs = $CleanMgrTimeoutMin * 60 * 1000
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1697,7 +1718,7 @@ function Invoke-ConfirmedCategories {
             $running = @(Get-Process -Name $cat.StopProcesses -ErrorAction SilentlyContinue)
             if ($running.Count -gt 0) {
                 $rNames = ($running | Select-Object -ExpandProperty Name -Unique) -join ', '
-                Write-Host (" ⚠ Skipped {0}: app is currently running ({1})" -f $cat.Name, $rNames) -ForegroundColor Yellow
+                Write-Host (" [WARN] Skipped {0}: app is currently running ({1})" -f $cat.Name, $rNames) -ForegroundColor Yellow
                 Write-Log -Message "Skipped $($cat.Name) because processes were running: $rNames" -Level 'SKIP'
                 $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Skipped (App Running)'; Reclaimed = 0; Locked = 0 })
                 continue
@@ -1707,7 +1728,7 @@ function Invoke-ConfirmedCategories {
         switch ($cat.Method) {
             'Files' {
                 $r = Invoke-FileListCleanup -Category $cat -UseQuarantine $UseQuarantine -QuarantineSetDir $QuarantineSetDir
-                Write-Host (" ✔ {0,-48} {1,10} reclaimed ({2} locked)" -f $cat.Name, (Format-Bytes $r.FreedBytes), $r.LockedCount) -ForegroundColor Green
+                Write-Host (" [OK] {0,-48} {1,10} reclaimed ({2} locked)" -f $cat.Name, (Format-Bytes $r.FreedBytes), $r.LockedCount) -ForegroundColor Green
                 $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Cleaned'; Reclaimed = $r.FreedBytes; Locked = $r.LockedCount })
             }
             'WUFiles' {
@@ -1715,7 +1736,7 @@ function Invoke-ConfirmedCategories {
                 try {
                     Stop-Service -Name $services -Force -ErrorAction SilentlyContinue
                     $r = Invoke-FileListCleanup -Category $cat -UseQuarantine $UseQuarantine -QuarantineSetDir $QuarantineSetDir
-                    Write-Host (" ✔ {0,-48} {1,10} reclaimed ({2} locked)" -f $cat.Name, (Format-Bytes $r.FreedBytes), $r.LockedCount) -ForegroundColor Green
+                    Write-Host (" [OK] {0,-48} {1,10} reclaimed ({2} locked)" -f $cat.Name, (Format-Bytes $r.FreedBytes), $r.LockedCount) -ForegroundColor Green
                     $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Cleaned'; Reclaimed = $r.FreedBytes; Locked = $r.LockedCount })
                 } finally {
                     Start-Service -Name $services -ErrorAction SilentlyContinue
@@ -1726,12 +1747,12 @@ function Invoke-ConfirmedCategories {
                     Start-Service -Name 'dosvc' -ErrorAction SilentlyContinue
                     Delete-DeliveryOptimizationCache -Force -ErrorAction Stop
                     $script:Stats.FreedBytes += [math]::Max(0, $cat.EstimatedBytes)
-                    Write-Host (" ✔ {0,-48} {1,10} reclaimed" -f $cat.Name, (Format-Bytes $cat.EstimatedBytes)) -ForegroundColor Green
+                    Write-Host (" [OK] {0,-48} {1,10} reclaimed" -f $cat.Name, (Format-Bytes $cat.EstimatedBytes)) -ForegroundColor Green
                     Write-Log -Message 'Cleared Delivery Optimization Cache via Delete-DeliveryOptimizationCache' -Level 'DELETE'
                     $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Cleaned'; Reclaimed = $cat.EstimatedBytes; Locked = 0 })
                 } catch {
                     $script:Stats.ErrorCount++
-                    Write-Host (" ✖ {0}: {1}" -f $cat.Name, $_.Exception.Message) -ForegroundColor Red
+                    Write-Host (" [ERR] {0}: {1}" -f $cat.Name, $_.Exception.Message) -ForegroundColor Red
                     Write-Log -Message "DeliveryOptimization error: $($_.Exception.Message)" -Level 'ERROR'
                 }
             }
@@ -1739,7 +1760,7 @@ function Invoke-ConfirmedCategories {
                 try {
                     Clear-RecycleBin -Force -ErrorAction Stop
                     $script:Stats.FreedBytes += [math]::Max(0, $cat.EstimatedBytes)
-                    Write-Host (" ✔ {0,-48} {1,10} reclaimed" -f $cat.Name, (Format-Bytes $cat.EstimatedBytes)) -ForegroundColor Green
+                    Write-Host (" [OK] {0,-48} {1,10} reclaimed" -f $cat.Name, (Format-Bytes $cat.EstimatedBytes)) -ForegroundColor Green
                     Write-Log -Message 'Emptied Recycle Bin via Clear-RecycleBin' -Level 'DELETE'
                     $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Cleaned'; Reclaimed = $cat.EstimatedBytes; Locked = 0 })
                 } catch {
@@ -1761,7 +1782,7 @@ function Invoke-ConfirmedCategories {
                         Write-Log -Message "Skipped in-use driver $($pkg.PublishedName): $out" -Level 'SKIP'
                     }
                 }
-                Write-Host (" ✔ {0,-48} {1,10} reclaimed ({2} in-use kept)" -f $cat.Name, (Format-Bytes $drvFreed), $drvLocked) -ForegroundColor Green
+                Write-Host (" [OK] {0,-48} {1,10} reclaimed ({2} in-use kept)" -f $cat.Name, (Format-Bytes $drvFreed), $drvLocked) -ForegroundColor Green
                 $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Cleaned'; Reclaimed = $drvFreed; Locked = $drvLocked })
             }
             'VSS_Old' {
@@ -1776,7 +1797,7 @@ function Invoke-ConfirmedCategories {
                         Write-Log -Message "Deleted old VSS shadow copy $id" -Level 'DELETE'
                     }
                 }
-                Write-Host (" ✔ {0,-48} {1} old shadow copies removed" -f $cat.Name, $removedCount) -ForegroundColor Green
+                Write-Host (" [OK] {0,-48} {1} old shadow copies removed" -f $cat.Name, $removedCount) -ForegroundColor Green
                 $results.Add([pscustomobject]@{ Category = $cat.Name; Status = "Removed $removedCount shadows"; Reclaimed = [math]::Max(0, $cat.EstimatedBytes); Locked = 0 })
             }
             'CleanMgr' {
@@ -1813,7 +1834,7 @@ function Invoke-ConfirmedCategories {
                 $afterScan = Get-FilesSafe -Roots @($evtxDir) -FileFilter '*.evtx' -CategoryName 'Measuring Event Logs After Clear'
                 $reclaimedEvtx = [math]::Max([int64]0, ($beforeScan.TotalBytes - $afterScan.TotalBytes))
                 $script:Stats.FreedBytes += $reclaimedEvtx
-                Write-Host (" ✔ {0,-48} {1,10} reclaimed ({2} logs cleared)" -f $cat.Name, (Format-Bytes $reclaimedEvtx), $cleared) -ForegroundColor Green
+                Write-Host (" [OK] {0,-48} {1,10} reclaimed ({2} logs cleared)" -f $cat.Name, (Format-Bytes $reclaimedEvtx), $cleared) -ForegroundColor Green
                 Write-Log -Message "Cleared $cleared Windows Event Logs ($skippedLogs skipped); reclaimed $reclaimedEvtx bytes" -Level 'DELETE'
                 $results.Add([pscustomobject]@{ Category = $cat.Name; Status = "Cleared $cleared logs"; Reclaimed = $reclaimedEvtx; Locked = $skippedLogs })
             }
@@ -1830,11 +1851,11 @@ function Invoke-ConfirmedCategories {
                             Write-Log -Message "Deleted Windows Search Index: $($f.FullName) ($($f.Length) B)" -Level 'DELETE'
                         }
                     }
-                    Write-Host (" ✔ {0,-48} {1,10} reclaimed" -f $cat.Name, (Format-Bytes $edbReclaimed)) -ForegroundColor Green
+                    Write-Host (" [OK] {0,-48} {1,10} reclaimed" -f $cat.Name, (Format-Bytes $edbReclaimed)) -ForegroundColor Green
                     $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Index Reset'; Reclaimed = $edbReclaimed; Locked = 0 })
                 } catch {
                     $script:Stats.ErrorCount++
-                    Write-Host (" ✖ {0}: {1}" -f $cat.Name, $_.Exception.Message) -ForegroundColor Red
+                    Write-Host (" [ERR] {0}: {1}" -f $cat.Name, $_.Exception.Message) -ForegroundColor Red
                     Write-Log -Message "SearchIndex reset error: $($_.Exception.Message)" -Level 'ERROR'
                 } finally {
                     Start-Service -Name 'WSearch' -ErrorAction SilentlyContinue
@@ -1870,7 +1891,7 @@ function Invoke-ConfirmedCategories {
                     $script:Stats.FreedBytes += $diff
                     Write-Log -Message "Compacted VHDX $($f.FullName): saved $diff bytes" -Level 'DELETE'
                 }
-                Write-Host (" ✔ {0,-48} {1,10} reclaimed" -f $cat.Name, (Format-Bytes $vhdxSaved)) -ForegroundColor Green
+                Write-Host (" [OK] {0,-48} {1,10} reclaimed" -f $cat.Name, (Format-Bytes $vhdxSaved)) -ForegroundColor Green
                 $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Compacted'; Reclaimed = $vhdxSaved; Locked = 0 })
             }
         }
@@ -2342,6 +2363,13 @@ try {
     if ($openReport -notmatch '^[Nn]$') {
         Start-Process $summary.ReportFile
     }
+    Read-Host "`nCleanup session finished. Press Enter to close this window"
+} catch {
+    Complete-AllProgress
+    Write-Host "`n[FATAL ERROR] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "$($_.InvocationInfo.PositionMessage)" -ForegroundColor DarkRed
+    try { Write-Log -Message "FATAL ERROR: $($_.Exception.Message) | $($_.InvocationInfo.PositionMessage)" -Level 'ERROR' } catch { }
+    Read-Host "`nPress Enter to close this window"
 } finally {
     Complete-AllProgress
     Set-PreventSleep -Enable $false
