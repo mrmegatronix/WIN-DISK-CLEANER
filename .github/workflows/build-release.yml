@@ -1,0 +1,49 @@
+name: Build Windows EXE & Release Bundle
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build SingleFile CMD & Portable ZIP
+        shell: pwsh
+        run: ./Build-Release.ps1
+
+      - name: Compile Native Windows 11 EXE (ps2exe)
+        shell: pwsh
+        run: |
+          Install-Module -Name ps2exe -Force -Scope CurrentUser
+          Invoke-ps2exe -inputFile "$PWD\Win11-DiskCleanup.ps1" `
+                        -outputFile "$PWD\dist\WIN-DISK-CLEANER.exe" `
+                        -title "WIN-DISK-CLEANER" `
+                        -description "Windows 11 Safe System Disk Cleanup, Driver & EventLog Backup, Quarantine & Repair" `
+                        -version "6.0.0.0" `
+                        -requireAdmin `
+                        -x64 `
+                        -conHost
+          $h = Get-FileHash -LiteralPath "$PWD\dist\WIN-DISK-CLEANER.exe" -Algorithm SHA256
+          Add-Content -LiteralPath "$PWD\dist\SHA256SUMS.txt" -Value ("{0}  WIN-DISK-CLEANER.exe" -f $h.Hash.ToLowerInvariant())
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: WIN-DISK-CLEANER-v6.0.0-Build
+          path: dist/*
+
+      - name: Attach EXE to Latest Release if Present
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v6.0.0 dist/WIN-DISK-CLEANER.exe dist/WIN-DISK-CLEANER-SingleFile.cmd dist/WIN-DISK-CLEANER-v6.0.0-Portable.zip dist/SHA256SUMS.txt --clobber 2>$null || Write-Host "Release v6.0.0 not created yet or upload skipped"
