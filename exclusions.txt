@@ -1,0 +1,8 @@
+# Win11-DiskCleanup Wildcard Exclusion Patterns
+# One wildcard pattern per line (supports environment variables).
+# Matching files are skipped during the read-only scan and never deleted or quarantined.
+#
+# Examples:
+# %LOCALAPPDATA%\Temp\MyImportantTool\*
+# *.vhdx
+# *.iso

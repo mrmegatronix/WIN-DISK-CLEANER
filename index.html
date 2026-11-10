@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WIN-DISK-CLEANER — Windows 11 Safe System Disk Cleanup</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0b0f19;
+    color: #e2e8f0;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    padding: 24px 36px;
+    max-width: 1920px;
+    margin: 0 auto;
+    overflow-x: hidden;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid #1e293b;
+    padding-bottom: 14px;
+    margin-bottom: 22px;
+  }
+  h1 {
+    font-size: 1.7rem;
+    color: #38bdf8;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .clock {
+    font-family: Consolas, monospace;
+    font-size: 1.5rem;
+    color: #22d3ee;
+    white-space: nowrap;
+  }
+  .blink { animation: blinker 1s step-start infinite; }
+  @keyframes blinker { 50% { opacity: 0; } }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 18px;
+    margin-bottom: 22px;
+  }
+  .card {
+    background: #111827;
+    border: 1px solid #1f2937;
+    border-radius: 10px;
+    padding: 18px 20px;
+    overflow: hidden;
+  }
+  .card h2 {
+    font-size: 1.05rem;
+    color: #38bdf8;
+    margin-bottom: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .card ul { list-style: none; }
+  .card li {
+    font-size: 0.9rem;
+    color: #cbd5e1;
+    padding: 5px 0;
+    border-bottom: 1px solid #1e293b;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .card li:last-child { border-bottom: none; }
+  .downloads {
+    display: flex;
+    gap: 14px;
+    margin-bottom: 22px;
+  }
+  .btn {
+    display: inline-block;
+    background: #0284c7;
+    color: #fff;
+    text-decoration: none;
+    padding: 10px 18px;
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 0.92rem;
+    white-space: nowrap;
+  }
+  .btn.secondary { background: #1e293b; border: 1px solid #334155; }
+  pre {
+    background: #090d16;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 14px 18px;
+    color: #38bdf8;
+    font-family: Consolas, monospace;
+    font-size: 0.9rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>WIN-DISK-CLEANER — Windows 11 Safe System Disk Cleanup Utility</h1>
+  <div class="clock"><span id="hh">00</span><span class="blink">:</span><span id="mm">00</span><span class="blink">:</span><span id="ss">00</span></div>
+</header>
+
+<div class="downloads">
+  <a class="btn" href="./Win11-DiskCleanup.ps1" download>Download Win11-DiskCleanup.ps1</a>
+  <a class="btn secondary" href="./Run-Cleanup.cmd" download>Download Run-Cleanup.cmd</a>
+  <a class="btn secondary" href="./exclusions.txt" download>Download exclusions.txt</a>
+  <a class="btn secondary" href="https://github.com/mrmegatronix/WIN-DISK-CLEANER" target="_blank" rel="noopener">GitHub Repository</a>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>1. Safety Architecture</h2>
+    <ul>
+      <li>Pre-Scan read-only system health &amp; disk checks</li>
+      <li>Scan-first architecture (exact byte measurement)</li>
+      <li>Per-category confirmation before any deletion</li>
+      <li>No symlink or junction (ReparsePoint) traversal</li>
+      <li>Mandatory verified driver backup via pnputil</li>
+      <li>7-day Quarantine mode on secondary drive</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h2>2. Cleanup Categories (22+)</h2>
+    <ul>
+      <li>User/System Temp, WER, CrashDumps, D3DSCache</li>
+      <li>Browser Caches (Edge, Chrome, Brave, Firefox)</li>
+      <li>GPU Shader Caches &amp; Leftover Driver Folders</li>
+      <li>Developer Caches (npm, pip, NuGet, Gradle, Go)</li>
+      <li>App Caches (Teams, Discord, Spotify, Office)</li>
+      <li>Superseded Drivers, WinSxS DISM, Old VSS Shadows</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h2>3. Repair, UI &amp; Reporting</h2>
+    <ul>
+      <li>3-level nested PowerShell progress bars</li>
+      <li>Window title status bar + Windows Terminal progress</li>
+      <li>System Repair mode (DISM RestoreHealth + SFC)</li>
+      <li>Read-only Top 25 folders, Old Downloads &amp; App sizes</li>
+      <li>Self-contained 1080p HTML report + history.csv</li>
+      <li>Automatic SSD TRIM &amp; Sleep Prevention</li>
+    </ul>
+  </div>
+</div>
+
+<pre>powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Win11-DiskCleanup.ps1 -MinAgeHours 24 -QuarantineDays 7</pre>
+
+<script>
+  function updateClock() {
+    const now = new Date();
+    document.getElementById('hh').textContent = String(now.getHours()).padStart(2, '0');
+    document.getElementById('mm').textContent = String(now.getMinutes()).padStart(2, '0');
+    document.getElementById('ss').textContent = String(now.getSeconds()).padStart(2, '0');
+  }
+  updateClock();
+  setInterval(updateClock, 1000);
+</script>
+</body>
+</html>
