@@ -28,6 +28,9 @@ param(
     [string]$DriverBackupPath,
 
     [Parameter()]
+    [string]$EventLogBackupPath,
+
+    [Parameter()]
     [string]$ReportPath,
 
     [Parameter()]
@@ -949,7 +952,39 @@ function Get-CleanupCategories {
     Add-Cat -Id 'CleanMgr_TempSetup' -Name 'Disk Cleanup: Temporary Setup Files (cleanmgr)' -Risk 'Safe' -Method 'CleanMgr' `
         -PresetModes @('Quick','Standard','Deep')
 
-    # 19. Custom Extra Paths (user-configured)
+    # 19. Windows Event Logs (wevtutil, mandatory backup before clearing)
+    $evtxRoot = Join-Path $env:SystemRoot 'System32\winevt\Logs'
+    Add-Cat -Id 'EventLogs' -Name 'Windows Event Logs (Backup Required Before Clear)' -Risk 'Moderate' -Method 'EventLogs' `
+        -Roots @($evtxRoot) -FileFilter '*.evtx' `
+        -WarningText 'Exports all .evtx logs to your chosen backup folder first, verifies the backup, then clears Event Logs via wevtutil.' `
+        -PresetModes @('Deep')
+
+    # 20. Windows Search Index Database (Windows.edb rebuild)
+    $edbRoot = Join-Path $env:ProgramData 'Microsoft\Search\Data\Applications\Windows'
+    Add-Cat -Id 'SearchIndex' -Name 'Windows Search Index Database (Windows.edb Rebuild)' -Risk 'Moderate' -Method 'SearchIndex' `
+        -Roots @($edbRoot) -FileFilter 'Windows.edb' `
+        -WarningText 'Stops Windows Search (WSearch), deletes bloated Windows.edb, and restarts WSearch to rebuild the index in the background.' `
+        -PresetModes @('Deep')
+
+    # 21. WSL2 & Docker Virtual Disks (ext4.vhdx compaction)
+    $vhdxRoots = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($p in $profs) {
+        $dockerWsl = Join-Path $p.LocalApp 'Docker\wsl'
+        if (Test-Path -LiteralPath $dockerWsl) { $vhdxRoots.Add($dockerWsl) }
+        $pkgsDir = Join-Path $p.LocalApp 'Packages'
+        if (Test-Path -LiteralPath $pkgsDir) {
+            foreach ($pkg in (Get-ChildItem -LiteralPath $pkgsDir -Directory -ErrorAction SilentlyContinue)) {
+                $ls = Join-Path $pkg.FullName 'LocalState'
+                if (Test-Path -LiteralPath (Join-Path $ls 'ext4.vhdx')) { $vhdxRoots.Add($ls) }
+            }
+        }
+    }
+    Add-Cat -Id 'WslVhdxCompact' -Name 'WSL2 & Docker Virtual Disks (ext4.vhdx Compaction)' -Risk 'Moderate' -Method 'WslVhdx' `
+        -Roots $vhdxRoots.ToArray() -FileFilter '*.vhdx' `
+        -WarningText 'Shuts down WSL2 cleanly and shrinks unused slack space inside ext4.vhdx files without deleting Linux files.' `
+        -PresetModes @('Standard','Deep')
+
+    # 22. Custom Extra Paths (user-configured)
     $idx = 0
     foreach ($cp in $CustomPaths) {
         $idx++
@@ -1001,7 +1036,7 @@ function Measure-AllCategories {
         if ($cat.DisabledReason -ne '') { continue }
 
         switch ($cat.Method) {
-            { $_ -in @('Files','WUFiles','DeliveryOpt','WindowsOld') } {
+            { $_ -in @('Files','WUFiles','DeliveryOpt','WindowsOld','EventLogs','SearchIndex','WslVhdx') } {
                 if ($cat.Roots.Count -eq 0) { continue }
                 $age = if ($cat.UseAgeFilter) { $MinAgeHours } else { 0 }
                 $res = Get-FilesSafe -Roots $cat.Roots -FileFilter $cat.FileFilter -MinAgeHoursFilter $age -CategoryName $cat.Name
@@ -1327,6 +1362,83 @@ pause
 
     Write-Host ("[OK] Driver backup verified: {0} driver INF packages exported + Restore-Drivers.cmd created." -f $infFiles.Count) -ForegroundColor Green
     Write-Log -Message "Driver backup verified ($($infFiles.Count) INF files) at $DestinationPath" -Level 'INFO'
+    return $true
+}
+
+# ============================================================================
+# MANDATORY VERIFIED WINDOWS EVENT LOG BACKUP
+# ============================================================================
+function Backup-EventLogs {
+    param(
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [Parameter(Mandatory)][object[]]$ScannedEvtxFiles
+    )
+    $script:Stats.StageIndex = 4
+    $script:Stats.StageName  = 'Backing Up Event Logs'
+    Update-UiProgress -OverallPercent 51 -CategoryName 'Windows Event Log Backup' -CategoryPercent 0 -Force
+
+    Write-Host "`n[EVENT LOG BACKUP] Exporting Windows Event Logs (.evtx) to: $DestinationPath" -ForegroundColor Cyan
+    Write-Log -Message "Starting Windows Event Log backup to $DestinationPath" -Level 'INFO'
+
+    $evtxDir = Join-Path $DestinationPath 'evtx'
+    if (-not (Test-Path -LiteralPath $evtxDir)) {
+        New-Item -ItemType Directory -Path $evtxDir -Force | Out-Null
+    }
+
+    $total = [math]::Max(1, $ScannedEvtxFiles.Count)
+    $idx   = 0
+    $exportedCount = 0
+    $inventory = New-Object 'System.Collections.Generic.List[pscustomobject]'
+
+    foreach ($f in $ScannedEvtxFiles) {
+        $idx++
+        $pct = [int](($idx / $total) * 100)
+        $leaf = Split-Path -Path $f.FullName -Leaf
+        Update-UiProgress -OverallPercent 52 -CategoryName "Exporting Event Logs ($idx / $total)" -CategoryPercent $pct -ItemText $leaf
+
+        $destFile = Join-Path $evtxDir $leaf
+        try {
+            Copy-Item -LiteralPath $f.FullName -Destination $destFile -Force -ErrorAction Stop
+            $exportedCount++
+            $inventory.Add([pscustomobject]@{
+                FileName   = $leaf
+                SourcePath = $f.FullName
+                BackupPath = $destFile
+                Length     = $f.Length
+                Timestamp  = (Get-Date -Format 'o')
+            })
+        } catch {
+            Write-Log -Message "Could not copy event log $($f.FullName): $($_.Exception.Message)" -Level 'WARN'
+        }
+    }
+
+    # Also export core channels via wevtutil epl for consistent structured snapshots
+    foreach ($chan in @('System','Application','Security','Setup')) {
+        $chanFile = Join-Path $DestinationPath "channel_$chan.evtx"
+        try { [void](& wevtutil.exe epl $chan $chanFile /ow:true 2>$null) } catch { }
+    }
+
+    $csvPath = Join-Path $DestinationPath 'eventlogs_inventory.csv'
+    $inventory | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+
+    $helperCmd = Join-Path $DestinationPath 'Open-EventViewer.cmd'
+    $cmdBody = @"
+@echo off
+echo Opening backed up Windows Event Logs folder and Event Viewer...
+start "" "%~dp0evtx"
+start "" eventvwr.msc
+"@
+    Set-Content -LiteralPath $helperCmd -Value $cmdBody -Encoding ASCII
+
+    $backedUpFiles = @(Get-ChildItem -LiteralPath $evtxDir -Filter '*.evtx' -File -ErrorAction SilentlyContinue)
+    if ($backedUpFiles.Count -eq 0) {
+        Write-Host '[ERROR] Event Log backup verification failed: 0 .evtx files backed up!' -ForegroundColor Red
+        Write-Log -Message 'Event Log backup verification failed: 0 .evtx files backed up.' -Level 'ERROR'
+        return $false
+    }
+
+    Write-Host ("[OK] Event Log backup verified: {0} .evtx files archived + eventlogs_inventory.csv created." -f $backedUpFiles.Count) -ForegroundColor Green
+    Write-Log -Message "Event Log backup verified ($($backedUpFiles.Count) .evtx files) at $DestinationPath" -Level 'INFO'
     return $true
 }
 
@@ -1683,6 +1795,84 @@ function Invoke-ConfirmedCategories {
                 Invoke-DismCleanup -ResetBase $true
                 $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Completed'; Reclaimed = 0; Locked = 0 })
             }
+            'EventLogs' {
+                $evtxDir = Join-Path $env:SystemRoot 'System32\winevt\Logs'
+                $beforeScan = Get-FilesSafe -Roots @($evtxDir) -FileFilter '*.evtx' -CategoryName 'Measuring Event Logs Before Clear'
+                $channels = @(& wevtutil.exe el 2>$null)
+                $cleared = 0
+                $skippedLogs = 0
+                $cIdx = 0
+                $cTot = [math]::Max(1, $channels.Count)
+                foreach ($ch in $channels) {
+                    $cIdx++
+                    if ([string]::IsNullOrWhiteSpace($ch)) { continue }
+                    Update-UiProgress -CategoryName 'Clearing Windows Event Logs' -CategoryPercent ([int](($cIdx / $cTot) * 100)) -ItemText $ch
+                    [void](& wevtutil.exe cl "$ch" 2>$null)
+                    if ($LASTEXITCODE -eq 0) { $cleared++ } else { $skippedLogs++ }
+                }
+                $afterScan = Get-FilesSafe -Roots @($evtxDir) -FileFilter '*.evtx' -CategoryName 'Measuring Event Logs After Clear'
+                $reclaimedEvtx = [math]::Max([int64]0, ($beforeScan.TotalBytes - $afterScan.TotalBytes))
+                $script:Stats.FreedBytes += $reclaimedEvtx
+                Write-Host (" ✔ {0,-48} {1,10} reclaimed ({2} logs cleared)" -f $cat.Name, (Format-Bytes $reclaimedEvtx), $cleared) -ForegroundColor Green
+                Write-Log -Message "Cleared $cleared Windows Event Logs ($skippedLogs skipped); reclaimed $reclaimedEvtx bytes" -Level 'DELETE'
+                $results.Add([pscustomobject]@{ Category = $cat.Name; Status = "Cleared $cleared logs"; Reclaimed = $reclaimedEvtx; Locked = $skippedLogs })
+            }
+            'SearchIndex' {
+                $edbReclaimed = [int64]0
+                try {
+                    Stop-Service -Name 'WSearch' -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 1
+                    foreach ($f in $cat.ScannedFiles) {
+                        if (Test-Path -LiteralPath $f.FullName) {
+                            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+                            $edbReclaimed += $f.Length
+                            $script:Stats.FreedBytes += $f.Length
+                            Write-Log -Message "Deleted Windows Search Index: $($f.FullName) ($($f.Length) B)" -Level 'DELETE'
+                        }
+                    }
+                    Write-Host (" ✔ {0,-48} {1,10} reclaimed" -f $cat.Name, (Format-Bytes $edbReclaimed)) -ForegroundColor Green
+                    $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Index Reset'; Reclaimed = $edbReclaimed; Locked = 0 })
+                } catch {
+                    $script:Stats.ErrorCount++
+                    Write-Host (" ✖ {0}: {1}" -f $cat.Name, $_.Exception.Message) -ForegroundColor Red
+                    Write-Log -Message "SearchIndex reset error: $($_.Exception.Message)" -Level 'ERROR'
+                } finally {
+                    Start-Service -Name 'WSearch' -ErrorAction SilentlyContinue
+                }
+            }
+            'WslVhdx' {
+                $vhdxSaved = [int64]0
+                try { [void](& wsl.exe --shutdown 2>$null) } catch { }
+                $hasOptVhd = $null -ne (Get-Command -Name 'Optimize-VHD' -ErrorAction SilentlyContinue)
+                foreach ($f in $cat.ScannedFiles) {
+                    if (-not (Test-Path -LiteralPath $f.FullName)) { continue }
+                    $lenBefore = (Get-Item -LiteralPath $f.FullName -Force).Length
+                    Update-UiProgress -CategoryName 'Compacting WSL2/Docker VHDX' -CategoryPercent 50 -ItemText $f.FullName -Force
+                    if ($hasOptVhd) {
+                        try { Optimize-VHD -Path $f.FullName -Mode Full -ErrorAction Stop } catch { }
+                    } else {
+                        $dpScript = Join-Path $env:TEMP "compact_vhdx_$PID.txt"
+                        $dpLines = @(
+                            "select vdisk file=`"$($f.FullName)`"",
+                            'attach vdisk readonly',
+                            'compact vdisk',
+                            'detach vdisk',
+                            'exit'
+                        )
+                        Set-Content -LiteralPath $dpScript -Value ($dpLines -join "`r`n") -Encoding ASCII
+                        try { [void](& diskpart.exe /s $dpScript 2>$null) } finally {
+                            Remove-Item -LiteralPath $dpScript -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                    $lenAfter = (Get-Item -LiteralPath $f.FullName -Force).Length
+                    $diff = [math]::Max([int64]0, ($lenBefore - $lenAfter))
+                    $vhdxSaved += $diff
+                    $script:Stats.FreedBytes += $diff
+                    Write-Log -Message "Compacted VHDX $($f.FullName): saved $diff bytes" -Level 'DELETE'
+                }
+                Write-Host (" ✔ {0,-48} {1,10} reclaimed" -f $cat.Name, (Format-Bytes $vhdxSaved)) -ForegroundColor Green
+                $results.Add([pscustomobject]@{ Category = $cat.Name; Status = 'Compacted'; Reclaimed = $vhdxSaved; Locked = 0 })
+            }
         }
         Write-StatusLine
     }
@@ -1808,6 +1998,7 @@ function Export-HtmlReportAndHistory {
         [System.Collections.Generic.List[pscustomobject]]$Categories,
         [object[]]$ExecutionResults,
         [string]$DriverBackupDir,
+        [string]$EventLogBackupDir = '',
         [string]$QuarantineDir,
         [object[]]$RepairResults,
         [pscustomobject]$ReadOnlyReports
@@ -1923,7 +2114,7 @@ function Export-HtmlReportAndHistory {
 $roHtml
 <footer>
   <div>Log: $([System.Net.WebUtility]::HtmlEncode($script:LogFile))</div>
-  <div>Driver Backup: $([System.Net.WebUtility]::HtmlEncode($(if ($DriverBackupDir) {$DriverBackupDir} else {'None'}))) | Quarantine: $([System.Net.WebUtility]::HtmlEncode($(if ($QuarantineDir) {$QuarantineDir} else {'None'})))</div>
+  <div>Driver Backup: $([System.Net.WebUtility]::HtmlEncode($(if ($DriverBackupDir) {$DriverBackupDir} else {'None'}))) | EventLog Backup: $([System.Net.WebUtility]::HtmlEncode($(if ($EventLogBackupDir) {$EventLogBackupDir} else {'None'}))) | Quarantine: $([System.Net.WebUtility]::HtmlEncode($(if ($QuarantineDir) {$QuarantineDir} else {'None'})))</div>
 </footer>
 </body>
 </html>
@@ -2058,6 +2249,22 @@ try {
         }
     }
 
+    # Ask where to save Windows Event Log Backup if EventLogs is selected
+    $eventLogBackupDir = ''
+    $evtCat = $selectedCats | Where-Object { $_.Id -eq 'EventLogs' } | Select-Object -First 1
+    if ($evtCat) {
+        $evtSize = [math]::Max([int64]50MB, $evtCat.EstimatedBytes)
+        $eLoc = Select-StorageLocation -Purpose 'EventLogBackup' -RequiredBytes $evtSize -AllowSystemDrive $true -PresetPath $EventLogBackupPath
+        if ($eLoc.Action -eq 'Quit') { exit 0 }
+        if ($eLoc.Action -eq 'Skip') {
+            $evtCat.Confirmed = $false
+            $selectedCats = @($categories | Where-Object { $_.Confirmed })
+            Write-Host '  [INFO] Event Log backup skipped; Windows Event Logs cleanup has been DISABLED.' -ForegroundColor Yellow
+        } else {
+            $eventLogBackupDir = $eLoc.Path
+        }
+    }
+
     # Final Summary before touching anything
     $totalSelectedBytes = [int64](($selectedCats | Where-Object { $_.EstimatedBytes -gt 0 } | Measure-Object -Property EstimatedBytes -Sum).Sum)
     $script:Stats.EstimatedBytes = $totalSelectedBytes
@@ -2073,6 +2280,9 @@ try {
     Write-Host ("  Action Mode         : {0}" -f $(if ($useQuarantine) { "Quarantine ($quarantineDir)" } else { 'Permanent Delete' }))
     if ($driverBackupDir) {
         Write-Host ("  Driver Backup Path  : {0}" -f $driverBackupDir)
+    }
+    if ($eventLogBackupDir) {
+        Write-Host ("  EventLog Backup Path: {0}" -f $eventLogBackupDir)
     }
     Write-Host "===========================================================================`n" -ForegroundColor Cyan
 
@@ -2094,6 +2304,15 @@ try {
         }
     }
 
+    # Execute mandatory Event Log backup if EventLogs is still confirmed
+    if ($evtCat -and $evtCat.Confirmed) {
+        $evtOk = Backup-EventLogs -DestinationPath $eventLogBackupDir -ScannedEvtxFiles $evtCat.ScannedFiles
+        if (-not $evtOk) {
+            $evtCat.Confirmed = $false
+            Write-Host '[WARN] Event Log cleanup was deselected because Event Log backup verification did not pass.' -ForegroundColor Yellow
+        }
+    }
+
     $execResults = Invoke-ConfirmedCategories -Categories $categories -UseQuarantine $useQuarantine -QuarantineSetDir $quarantineDir
     Invoke-SsdTrimIfApplicable -IsSsd $preScan.IsSsd
 
@@ -2102,7 +2321,7 @@ try {
 
     $summary = Export-HtmlReportAndHistory -ModeName 'Cleanup' -PresetName $presetName -PreScan $preScan `
         -Categories $categories -ExecutionResults $execResults -DriverBackupDir $driverBackupDir `
-        -QuarantineDir $quarantineDir -RepairResults @() -ReadOnlyReports $roData
+        -EventLogBackupDir $eventLogBackupDir -QuarantineDir $quarantineDir -RepairResults @() -ReadOnlyReports $roData
 
     Complete-AllProgress
 

@@ -124,18 +124,18 @@
       <li>Scan-first architecture (exact byte measurement)</li>
       <li>Per-category confirmation before any deletion</li>
       <li>No symlink or junction (ReparsePoint) traversal</li>
-      <li>Mandatory verified driver backup via pnputil</li>
+      <li>Mandatory verified Driver &amp; Event Log backups</li>
       <li>7-day Quarantine mode on secondary drive</li>
     </ul>
   </div>
   <div class="card">
-    <h2>2. Cleanup Categories (22+)</h2>
+    <h2>2. Cleanup Categories (25+)</h2>
     <ul>
       <li>User/System Temp, WER, CrashDumps, D3DSCache</li>
-      <li>Browser Caches (Edge, Chrome, Brave, Firefox)</li>
-      <li>GPU Shader Caches &amp; Leftover Driver Folders</li>
-      <li>Developer Caches (npm, pip, NuGet, Gradle, Go)</li>
-      <li>App Caches (Teams, Discord, Spotify, Office)</li>
+      <li>Browser, GPU Shader, Developer &amp; App Caches</li>
+      <li>Windows Event Logs (.evtx Backup + Clear)</li>
+      <li>Windows Search Index (Windows.edb Rebuild)</li>
+      <li>WSL2 &amp; Docker Virtual Disks (ext4.vhdx Compact)</li>
       <li>Superseded Drivers, WinSxS DISM, Old VSS Shadows</li>
     </ul>
   </div>
@@ -153,6 +153,7 @@
 </div>
 
 <pre>powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Win11-DiskCleanup.ps1 -MinAgeHours 24 -QuarantineDays 7</pre>
+<pre style="margin-top:10px">irm https://mrmegatronix.github.io/WIN-DISK-CLEANER/Win11-DiskCleanup.ps1 -OutFile $env:TEMP\Win11-DiskCleanup.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\Win11-DiskCleanup.ps1</pre>
 
 <script>
   function updateClock() {
